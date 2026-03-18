@@ -52,7 +52,7 @@ public:
     callback_count_(0),
     stream_attempt_count_(0)
   {
-    RCLCPP_WARN(this->get_logger(), "NTRIPClientNode constructor entered");
+    RCLCPP_WARN(this->get_logger(), "[DEBUG] NTRIPClientNode constructor entered");
     RCLCPP_INFO(this->get_logger(), "starting %s", get_name());
 
     declare_parameter("use_https", false);
@@ -91,12 +91,10 @@ public:
       curl_easy_setopt(handle, CURLOPT_WRITEDATA, this);
       curl_easy_setopt(handle, CURLOPT_PRIVATE, reinterpret_cast<void *>(desiredCount));
 
-      RCLCPP_WARN(
-        this->get_logger(),
-        "Configured forced stream cutoff path. desiredCount=%d stored via CURLOPT_PRIVATE=%p",
-        desiredCount, reinterpret_cast<void *>(desiredCount));
+      RCLCPP_WARN(this->get_logger(), "[DEBUG] Configured forced stream cutoff path. desiredCount=%d stored via CURLOPT_PRIVATE=%p", desiredCount, reinterpret_cast<void *>(desiredCount));
 
       streamingThread_ = std::thread(&NTRIPClientNode::DoStreaming, this);
+      RCLCPP_WARN(this->get_logger(), "[DEBUG] Streaming thread started, joinable=%s", streamingThread_.joinable() ? "true" : "false");
     } else {
       RCLCPP_ERROR(this->get_logger(), "curl_easy_init returned null handle");
     }
@@ -131,133 +129,94 @@ private:
 
   static size_t WriteCallback(char * ptr, size_t size, size_t nmemb, void * userdata)
   {
-    RCLCPP_WARN(rclcpp::get_logger("ntrip_client"), "WriteCallback() entered");
     auto * node = reinterpret_cast<NTRIPClientNode *>(userdata);
+    RCLCPP_WARN(node->get_logger(), "[DEBUG] WriteCallback entered");
+    if (!node) {
+      RCLCPP_ERROR(rclcpp::get_logger("ntrip_client"), "WriteCallback: node is null");
+      return 0;
+    }
+    if (!node->curlHandle_ || !node->curlHandle_->handle) {
+      RCLCPP_ERROR(node->get_logger(), "WriteCallback: curlHandle or handle is null");
+      return 0;
+    }
     const size_t bytes = size * nmemb;
     const auto cb_num = ++node->callback_count_;
-
-    RCLCPP_INFO(
-      node->get_logger(),
-      "WriteCallback enter: cb=%lu bytes=%zu size=%zu nmemb=%zu desired_count_reached_=%s",
-      static_cast<unsigned long>(cb_num), bytes, size, nmemb,
-      node->desired_count_reached_ ? "true" : "false");
-
+    RCLCPP_INFO(node->get_logger(), "WriteCallback enter: cb=%lu bytes=%zu size=%zu nmemb=%zu desired_count_reached_=%s", static_cast<unsigned long>(cb_num), bytes, size, nmemb, node->desired_count_reached_ ? "true" : "false");
     auto message = std::make_unique<rtcm_msgs::msg::Message>();
     message->header.stamp = node->get_clock()->now();
     message->header.frame_id = node->mountpoint_;
     message->message.assign(ptr, ptr + bytes);
-    RCLCPP_WARN(
-      node->get_logger(),
-      "Publishing RTCM message: cb=%lu bytes=%zu size=%zu nmemb=%zu mountpoint=%s",
-      static_cast<unsigned long>(cb_num), bytes, size, nmemb, node->mountpoint_.c_str());
+    RCLCPP_WARN(node->get_logger(), "[DEBUG] Publishing RTCM message: cb=%lu bytes=%zu size=%zu nmemb=%zu mountpoint=%s", static_cast<unsigned long>(cb_num), bytes, size, nmemb, node->mountpoint_.c_str());
     node->rtcm_pub_->publish(std::move(message));
+    RCLCPP_WARN(node->get_logger(), "[DEBUG] After publish: subscription_count=%zu", node->rtcm_pub_->get_subscription_count());
     if (!node->rtcm_pub_->get_subscription_count()) {
       RCLCPP_WARN(node->get_logger(), "No subscribers on /rtcm topic at cb=%lu", static_cast<unsigned long>(cb_num));
     }
-
     static int recordCount = 0;
     recordCount++;
-
     int desiredCount = -1;
     CURLcode info_res = curl_easy_getinfo(node->curlHandle_->handle, CURLINFO_PRIVATE, &desiredCount);
-
-    RCLCPP_WARN(
-      node->get_logger(),
-      "WriteCallback state: cb=%lu recordCount=%d curl_easy_getinfo(CURLINFO_PRIVATE)=%d desiredCount=%d",
-      static_cast<unsigned long>(cb_num), recordCount, static_cast<int>(info_res), desiredCount);
-
+    RCLCPP_WARN(node->get_logger(), "[DEBUG] WriteCallback state: cb=%lu recordCount=%d curl_easy_getinfo(CURLINFO_PRIVATE)=%d desiredCount=%d", static_cast<unsigned long>(cb_num), recordCount, static_cast<int>(info_res), desiredCount);
     if (recordCount >= desiredCount) {
       recordCount = 0;
       node->desired_count_reached_ = true;
-
-      RCLCPP_ERROR(
-        node->get_logger(),
-        "WriteCallback forcing short return: cb=%lu bytes=%zu returning=%zu desiredCount=%d",
-        static_cast<unsigned long>(cb_num), bytes, bytes - 1, desiredCount);
-      RCLCPP_WARN(node->get_logger(), "Stream cutoff triggered: cb=%lu, desiredCount=%d", static_cast<unsigned long>(cb_num), desiredCount);
-
+      RCLCPP_ERROR(node->get_logger(), "WriteCallback forcing short return: cb=%lu bytes=%zu returning=%zu desiredCount=%d", static_cast<unsigned long>(cb_num), bytes, bytes - 1, desiredCount);
+      RCLCPP_WARN(node->get_logger(), "[DEBUG] Stream cutoff triggered: cb=%lu, desiredCount=%d", static_cast<unsigned long>(cb_num), desiredCount);
       return bytes - 1;
     }
-
-    RCLCPP_DEBUG(
-      node->get_logger(),
-      "WriteCallback normal return: cb=%lu bytes=%zu",
-      static_cast<unsigned long>(cb_num), bytes);
-
+    RCLCPP_DEBUG(node->get_logger(), "WriteCallback normal return: cb=%lu bytes=%zu", static_cast<unsigned long>(cb_num), bytes);
     return bytes;
   }
 
   void DoStreaming()
   {
-    RCLCPP_WARN(this->get_logger(), "DoStreaming() entered");
+    RCLCPP_WARN(this->get_logger(), "[DEBUG] DoStreaming() entered");
     while (!streaming_exit_) {
+      RCLCPP_WARN(this->get_logger(), "[DEBUG] DoStreaming loop: streaming_exit_=%s", streaming_exit_ ? "true" : "false");
       desired_count_reached_ = false;
       const auto attempt = ++stream_attempt_count_;
-
       char * effective_url = nullptr;
       curl_easy_getinfo(curlHandle_->handle, CURLINFO_EFFECTIVE_URL, &effective_url);
-
-      RCLCPP_WARN(
-        this->get_logger(),
-        "DoStreaming begin: attempt=%lu url=%s callback_count=%lu streaming_exit_=%s",
-        static_cast<unsigned long>(attempt),
-        effective_url ? effective_url : "<null>",
-        static_cast<unsigned long>(callback_count_.load()),
-        streaming_exit_ ? "true" : "false");
-
+      RCLCPP_WARN(this->get_logger(), "[DEBUG] DoStreaming begin: attempt=%lu url=%s callback_count=%lu streaming_exit_=%s", static_cast<unsigned long>(attempt), effective_url ? effective_url : "<null>", static_cast<unsigned long>(callback_count_.load()), streaming_exit_ ? "true" : "false");
+      if (!curlHandle_ || !curlHandle_->handle) {
+        RCLCPP_ERROR(this->get_logger(), "DoStreaming: curlHandle or handle is null");
+        break;
+      }
       CURLcode res = curl_easy_perform(curlHandle_->handle);
-
+      RCLCPP_WARN(this->get_logger(), "[DEBUG] DoStreaming curl_easy_perform returned code=%d (%s)", static_cast<int>(res), curl_easy_strerror(res));
       long response_code = 0;
       curl_easy_getinfo(curlHandle_->handle, CURLINFO_RESPONSE_CODE, &response_code);
       curl_easy_getinfo(curlHandle_->handle, CURLINFO_EFFECTIVE_URL, &effective_url);
-
-      RCLCPP_ERROR(
-        this->get_logger(),
-        "DoStreaming end: attempt=%lu res=%d (%s) response_code=%ld desired_count_reached_=%s callback_count=%lu url=%s streaming_exit_=%s",
-        static_cast<unsigned long>(attempt),
-        static_cast<int>(res),
-        curl_easy_strerror(res),
-        response_code,
-        desired_count_reached_ ? "true" : "false",
-        static_cast<unsigned long>(callback_count_.load()),
-        effective_url ? effective_url : "<null>",
-        streaming_exit_ ? "true" : "false");
-
+      RCLCPP_ERROR(this->get_logger(), "DoStreaming end: attempt=%lu res=%d (%s) response_code=%ld desired_count_reached_=%s callback_count=%lu url=%s streaming_exit_=%s", static_cast<unsigned long>(attempt), static_cast<int>(res), curl_easy_strerror(res), response_code, desired_count_reached_ ? "true" : "false", static_cast<unsigned long>(callback_count_.load()), effective_url ? effective_url : "<null>", streaming_exit_ ? "true" : "false");
       if (res != CURLE_OK) {
         if (desired_count_reached_) {
-          RCLCPP_ERROR(
-            this->get_logger(),
-            "DoStreaming exited immediately after callback forced cutoff; sleeping 100 ms before retry");
+          RCLCPP_ERROR(this->get_logger(), "DoStreaming exited immediately after callback forced cutoff; sleeping 100 ms before retry");
           rclcpp::sleep_for(std::chrono::milliseconds(100));
-          RCLCPP_WARN(this->get_logger(), "DoStreaming retry after forced cutoff, attempt=%lu", static_cast<unsigned long>(attempt));
+          RCLCPP_WARN(this->get_logger(), "[DEBUG] DoStreaming retry after forced cutoff, attempt=%lu", static_cast<unsigned long>(attempt));
         } else {
-          RCLCPP_ERROR(
-            this->get_logger(),
-            "DoStreaming real error path; sleeping 1 s before retry");
+          RCLCPP_ERROR(this->get_logger(), "DoStreaming real error path; sleeping 1 s before retry");
           rclcpp::sleep_for(std::chrono::seconds(1));
-          RCLCPP_WARN(this->get_logger(), "DoStreaming retry after error, attempt=%lu", static_cast<unsigned long>(attempt));
+          RCLCPP_WARN(this->get_logger(), "[DEBUG] DoStreaming retry after error, attempt=%lu", static_cast<unsigned long>(attempt));
         }
       } else {
-        RCLCPP_WARN(
-          this->get_logger(),
-          "DoStreaming returned CURLE_OK; loop will restart unless streaming_exit_ is true");
+        RCLCPP_WARN(this->get_logger(), "[DEBUG] DoStreaming returned CURLE_OK; loop will restart unless streaming_exit_ is true");
         if (streaming_exit_) {
-          RCLCPP_WARN(this->get_logger(), "DoStreaming exiting loop due to streaming_exit_ true");
+          RCLCPP_WARN(this->get_logger(), "[DEBUG] DoStreaming exiting loop due to streaming_exit_ true");
         }
       }
     }
-
     RCLCPP_INFO(this->get_logger(), "DoStreaming exiting because streaming_exit_ became true");
+    RCLCPP_WARN(this->get_logger(), "[DEBUG] DoStreaming exit: streamingThread.joinable()=%s", streamingThread_.joinable() ? "true" : "false");
   }
 
 public:
-  NTRIP_CLIENT_NODE_LOCAL
   ~NTRIPClientNode()
   {
-    RCLCPP_WARN(this->get_logger(), "~NTRIPClientNode() entered");
+    RCLCPP_WARN(this->get_logger(), "[DEBUG] ~NTRIPClientNode() entered");
     streaming_exit_ = true;
     if (streamingThread_.joinable()) {
       streamingThread_.join();
+      RCLCPP_WARN(this->get_logger(), "[DEBUG] streamingThread joined in destructor");
     }
     curlHandle_.reset();
     curl_global_cleanup();
