@@ -30,8 +30,13 @@ struct CurlHandle
 {
   CURL * handle;
   CurlHandle()
-  : handle(curl_easy_init()) {}
-  ~CurlHandle() {curl_easy_cleanup(handle);}
+  : handle(curl_easy_init()) {
+    RCLCPP_WARN(rclcpp::get_logger("ntrip_client"), "CurlHandle constructor entered");
+  }
+  ~CurlHandle() {
+    RCLCPP_WARN(rclcpp::get_logger("ntrip_client"), "CurlHandle destructor entered");
+    curl_easy_cleanup(handle);
+  }
 };
 
 class NTRIPClientNode : public rclcpp::Node
@@ -41,8 +46,13 @@ public:
   explicit NTRIPClientNode(const rclcpp::NodeOptions & options)
   : Node("ntrip_client",
       rclcpp::NodeOptions(options)),
-    curlHandle_(std::make_shared<CurlHandle>())
+    curlHandle_(std::make_shared<CurlHandle>()),
+    streaming_exit_(false),
+    desired_count_reached_(false),
+    callback_count_(0),
+    stream_attempt_count_(0)
   {
+    RCLCPP_WARN(this->get_logger(), "NTRIPClientNode constructor entered");
     RCLCPP_INFO(this->get_logger(), "starting %s", get_name());
 
     declare_parameter("use_https", false);
@@ -60,52 +70,44 @@ public:
     password_ = get_parameter("password").as_string();
 
     std::string url = ConnectionUrl();
-
     RCLCPP_INFO(this->get_logger(), "ntrip connection url: '%s'", url.c_str());
 
     std::string userpwd = username_ + ":" + password_;
     RCLCPP_DEBUG(this->get_logger(), "userpwd: '%s'", userpwd.c_str());
 
-    // Create the publisher for rtcm_msgs::msg::Message
     rtcm_pub_ = this->create_publisher<rtcm_msgs::msg::Message>("/rtcm", 10);
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    // Set the desired record count - libcurl will keep reading from the ntrip castor indefinitly
-    // this is used to force it to exit in WriteCallback. In DoStreaming it will check to see if
-    // streaing_exit_ is true, such that the ros2 node can terminate cleanly
     int desiredCount = 10;
-
     auto handle = curlHandle_->handle;
     if (handle) {
       curl_easy_setopt(handle, CURLOPT_URL, url.c_str());
       curl_easy_setopt(handle, CURLOPT_HTTP09_ALLOWED, true);
       curl_easy_setopt(handle, CURLOPT_USERPWD, userpwd.c_str());
-      // curl_easy_setopt(handle, CURLOPT_NOPROGRESS, 0L);
-      // curl_easy_setopt(handle, CURLOPT_VERBOSE, 1L);
       curl_easy_setopt(handle, CURLOPT_USERAGENT, "NTRIP ros2/ublox_dgnss");
       curl_easy_setopt(handle, CURLOPT_FAILONERROR, true);
       curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, &NTRIPClientNode::WriteCallback);
-      curl_easy_setopt(curlHandle_->handle, CURLOPT_WRITEDATA, this);
-      curl_easy_setopt(
-        curlHandle_->handle, CURLOPT_PRIVATE,
-        reinterpret_cast<void *>(desiredCount));
+      curl_easy_setopt(handle, CURLOPT_WRITEDATA, this);
+      curl_easy_setopt(handle, CURLOPT_PRIVATE, reinterpret_cast<void *>(desiredCount));
 
-      // Start the streaming in a separate thread
-      streaming_exit_ = false;
+      RCLCPP_WARN(
+        this->get_logger(),
+        "Configured forced stream cutoff path. desiredCount=%d stored via CURLOPT_PRIVATE=%p",
+        desiredCount, reinterpret_cast<void *>(desiredCount));
+
       streamingThread_ = std::thread(&NTRIPClientNode::DoStreaming, this);
+    } else {
+      RCLCPP_ERROR(this->get_logger(), "curl_easy_init returned null handle");
     }
   }
 
 private:
-  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameters_callback_handle_;
   std::shared_ptr<CurlHandle> curlHandle_;
   std::thread streamingThread_;
-
   bool streaming_exit_;
   bool desired_count_reached_;
 
-  // NTRIP castor connection
   bool use_https_;
   std::string host_;
   int port_;
@@ -115,123 +117,151 @@ private:
 
   rclcpp::Publisher<rtcm_msgs::msg::Message>::SharedPtr rtcm_pub_;
 
+  std::atomic<uint64_t> callback_count_;
+  std::atomic<uint64_t> stream_attempt_count_;
+
   std::string ConnectionUrl()
   {
-    std::string url;
+    RCLCPP_WARN(this->get_logger(), "ConnectionUrl() entered");
     if (use_https_) {
-      url = "https://" + host_ + ":" + std::to_string(port_) + "/" + mountpoint_;
-    } else {
-      url = "http://" + host_ + ":" + std::to_string(port_) + "/" + mountpoint_;
+      return "https://" + host_ + ":" + std::to_string(port_) + "/" + mountpoint_;
     }
-
-    return url;
+    return "http://" + host_ + ":" + std::to_string(port_) + "/" + mountpoint_;
   }
 
   static size_t WriteCallback(char * ptr, size_t size, size_t nmemb, void * userdata)
   {
-    NTRIPClientNode * node = reinterpret_cast<NTRIPClientNode *>(userdata);
+    RCLCPP_WARN(rclcpp::get_logger("ntrip_client"), "WriteCallback() entered");
+    auto * node = reinterpret_cast<NTRIPClientNode *>(userdata);
+    const size_t bytes = size * nmemb;
+    const auto cb_num = ++node->callback_count_;
 
-    // code doesnt work in Humble
-    // if (node->get_logger().get_effective_level() == rclcpp::Logger::Level::Debug) {
-    // Convert the received data to a hexadecimal string
-    std::stringstream hexStream;
-    hexStream << std::hex << std::setfill('0');
-    for (size_t i = 0; i < size * nmemb; i++) {
-      hexStream << std::setw(2) << static_cast<int>(ptr[i]);
-    }
-    std::string hexString = hexStream.str();
+    RCLCPP_INFO(
+      node->get_logger(),
+      "WriteCallback enter: cb=%lu bytes=%zu size=%zu nmemb=%zu desired_count_reached_=%s",
+      static_cast<unsigned long>(cb_num), bytes, size, nmemb,
+      node->desired_count_reached_ ? "true" : "false");
 
-    // Log the hexadecimal string as a debug message
-    RCLCPP_DEBUG(
-      node->get_logger(), "Received size: %ld nmemb: %ld data: %s", size, nmemb,
-      hexString.c_str());
-    // }
-
-    // Create an instance of the message and populate
     auto message = std::make_unique<rtcm_msgs::msg::Message>();
     message->header.stamp = node->get_clock()->now();
     message->header.frame_id = node->mountpoint_;
-
-    // Set the data from the char* ptr
-    message->message.assign(ptr, ptr + size * nmemb);
-
-    // Publish the message
+    message->message.assign(ptr, ptr + bytes);
+    RCLCPP_WARN(
+      node->get_logger(),
+      "Publishing RTCM message: cb=%lu bytes=%zu size=%zu nmemb=%zu mountpoint=%s",
+      static_cast<unsigned long>(cb_num), bytes, size, nmemb, node->mountpoint_.c_str());
     node->rtcm_pub_->publish(std::move(message));
+    if (!node->rtcm_pub_->get_subscription_count()) {
+      RCLCPP_WARN(node->get_logger(), "No subscribers on /rtcm topic at cb=%lu", static_cast<unsigned long>(cb_num));
+    }
 
-    // Keep track of the number of records received
     static int recordCount = 0;
     recordCount++;
 
-    // Get the desired count from the private parameter
-    int desiredCount;
-    curl_easy_getinfo(node->curlHandle_->handle, CURLINFO_PRIVATE, &desiredCount);
+    int desiredCount = -1;
+    CURLcode info_res = curl_easy_getinfo(node->curlHandle_->handle, CURLINFO_PRIVATE, &desiredCount);
 
+    RCLCPP_WARN(
+      node->get_logger(),
+      "WriteCallback state: cb=%lu recordCount=%d curl_easy_getinfo(CURLINFO_PRIVATE)=%d desiredCount=%d",
+      static_cast<unsigned long>(cb_num), recordCount, static_cast<int>(info_res), desiredCount);
 
-    // Check if the desired count is reached
     if (recordCount >= desiredCount) {
       recordCount = 0;
-
       node->desired_count_reached_ = true;
 
-      // Returning a value different from the received data size
-      // will signal libcurl to stop receiving further data
-      return size * nmemb - 1;
+      RCLCPP_ERROR(
+        node->get_logger(),
+        "WriteCallback forcing short return: cb=%lu bytes=%zu returning=%zu desiredCount=%d",
+        static_cast<unsigned long>(cb_num), bytes, bytes - 1, desiredCount);
+      RCLCPP_WARN(node->get_logger(), "Stream cutoff triggered: cb=%lu, desiredCount=%d", static_cast<unsigned long>(cb_num), desiredCount);
+
+      return bytes - 1;
     }
 
-    // Returning the actual received data size will continue the stream
-    return size * nmemb;
+    RCLCPP_DEBUG(
+      node->get_logger(),
+      "WriteCallback normal return: cb=%lu bytes=%zu",
+      static_cast<unsigned long>(cb_num), bytes);
+
+    return bytes;
   }
 
   void DoStreaming()
   {
+    RCLCPP_WARN(this->get_logger(), "DoStreaming() entered");
     while (!streaming_exit_) {
       desired_count_reached_ = false;
+      const auto attempt = ++stream_attempt_count_;
 
-      // Perform the request
+      char * effective_url = nullptr;
+      curl_easy_getinfo(curlHandle_->handle, CURLINFO_EFFECTIVE_URL, &effective_url);
+
+      RCLCPP_WARN(
+        this->get_logger(),
+        "DoStreaming begin: attempt=%lu url=%s callback_count=%lu streaming_exit_=%s",
+        static_cast<unsigned long>(attempt),
+        effective_url ? effective_url : "<null>",
+        static_cast<unsigned long>(callback_count_.load()),
+        streaming_exit_ ? "true" : "false");
+
       CURLcode res = curl_easy_perform(curlHandle_->handle);
 
-      // Check for any errors
+      long response_code = 0;
+      curl_easy_getinfo(curlHandle_->handle, CURLINFO_RESPONSE_CODE, &response_code);
+      curl_easy_getinfo(curlHandle_->handle, CURLINFO_EFFECTIVE_URL, &effective_url);
+
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "DoStreaming end: attempt=%lu res=%d (%s) response_code=%ld desired_count_reached_=%s callback_count=%lu url=%s streaming_exit_=%s",
+        static_cast<unsigned long>(attempt),
+        static_cast<int>(res),
+        curl_easy_strerror(res),
+        response_code,
+        desired_count_reached_ ? "true" : "false",
+        static_cast<unsigned long>(callback_count_.load()),
+        effective_url ? effective_url : "<null>",
+        streaming_exit_ ? "true" : "false");
+
       if (res != CURLE_OK) {
-
         if (desired_count_reached_) {
-          RCLCPP_DEBUG(this->get_logger(), "Processed desired count... ");
-          // Sleep for 100 mili seconds
+          RCLCPP_ERROR(
+            this->get_logger(),
+            "DoStreaming exited immediately after callback forced cutoff; sleeping 100 ms before retry");
           rclcpp::sleep_for(std::chrono::milliseconds(100));
+          RCLCPP_WARN(this->get_logger(), "DoStreaming retry after forced cutoff, attempt=%lu", static_cast<unsigned long>(attempt));
         } else {
-
-          // Retrieve and log the effective URL
-          char * effectiveUrl;
-          curl_easy_getinfo(curlHandle_->handle, CURLINFO_EFFECTIVE_URL, &effectiveUrl);
           RCLCPP_ERROR(
-            this->get_logger(), "Failed to perform streaming request for URL: %s", effectiveUrl);
-
-          // Retrieve and log the response code
-          long responseCode;
-          curl_easy_getinfo(curlHandle_->handle, CURLINFO_RESPONSE_CODE, &responseCode);
-          RCLCPP_ERROR(this->get_logger(), "Response code: %ld", responseCode);
-
-          // Handle the error
-          RCLCPP_ERROR(
-            this->get_logger(), "Failed to perform streaming request: %s", curl_easy_strerror(res));
-
-          // Sleep for 1 second
+            this->get_logger(),
+            "DoStreaming real error path; sleeping 1 s before retry");
           rclcpp::sleep_for(std::chrono::seconds(1));
+          RCLCPP_WARN(this->get_logger(), "DoStreaming retry after error, attempt=%lu", static_cast<unsigned long>(attempt));
+        }
+      } else {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "DoStreaming returned CURLE_OK; loop will restart unless streaming_exit_ is true");
+        if (streaming_exit_) {
+          RCLCPP_WARN(this->get_logger(), "DoStreaming exiting loop due to streaming_exit_ true");
         }
       }
     }
+
+    RCLCPP_INFO(this->get_logger(), "DoStreaming exiting because streaming_exit_ became true");
   }
 
 public:
   NTRIP_CLIENT_NODE_LOCAL
   ~NTRIPClientNode()
   {
+    RCLCPP_WARN(this->get_logger(), "~NTRIPClientNode() entered");
     streaming_exit_ = true;
-
-    // Wait for the streaming thread to finish
-    streamingThread_.join();
-
+    if (streamingThread_.joinable()) {
+      streamingThread_.join();
+    }
     curlHandle_.reset();
     curl_global_cleanup();
+    RCLCPP_WARN(this->get_logger(), "NTRIPClientNode destructor called, streaming_exit_=%s", streaming_exit_ ? "true" : "false");
     RCLCPP_INFO(this->get_logger(), "finished");
   }
 };
